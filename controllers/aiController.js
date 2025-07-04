@@ -1,9 +1,5 @@
 const { roadtripAdvisorService } = require("../services/aiService.js");
 const dataService = require("../services/dataService");
-const {
-  aiRequestsTotal,
-  aiResponseTime
-} = require("../services/metricsService");
 const logger = require("../utils/logger.js");
 
 /* Demande à l'IA un conseil personnalisé de roadtrip */
@@ -18,21 +14,10 @@ const askRoadtripAdvisor = async (req, res) => {
   const start = process.hrtime();
   
   try {
-    aiRequestsTotal.inc({ type: 'roadtrip_advisor', status: 'started' });
-
     const result = await roadtripAdvisorService({ query: input, ...params });
 
-    const [s, ns] = process.hrtime(start);
-    const seconds = s + ns / 1e9;
-    aiResponseTime.observe({ type: 'roadtrip_advisor' }, seconds);
-
-    // 🔧 CORRECTION : Distinguer les erreurs de validation des vraies erreurs
     if (result.type === 'error') {
-      // Vérifier si c'est une erreur de validation (durée dépassée)
       if (result.max_duration && result.requested_duration) {
-        // C'est une erreur de validation de durée - Status 200 avec le message d'erreur
-        aiRequestsTotal.inc({ type: 'roadtrip_advisor', status: 'validation_error' });
-        
         return res.status(200).json({
           role: 'assistant',
           content: result.message,
@@ -43,8 +28,6 @@ const askRoadtripAdvisor = async (req, res) => {
           details: result
         });
       } else if (result.error_type === 'invalid_topic') {
-        // C'est une erreur de sujet non valide - Status 200 avec le message d'erreur
-        aiRequestsTotal.inc({ type: 'roadtrip_advisor', status: 'invalid_topic' });
         
         return res.status(200).json({
           role: 'assistant',
@@ -56,14 +39,11 @@ const askRoadtripAdvisor = async (req, res) => {
           details: result
         });
       } else {
-        // C'est une vraie erreur technique - Status 500
-        aiRequestsTotal.inc({ type: 'roadtrip_advisor', status: 'failed' });
         logger.error("💥 Erreur technique dans roadtripAdvisorService:", result);
         return res.status(500).json(result);
       }
     }
 
-    // Succès - Formater la réponse
     const formattedContent = formatRoadtripResponse(result);
     
     const response = {
@@ -73,23 +53,19 @@ const askRoadtripAdvisor = async (req, res) => {
       conversationId: params.conversationId
     };
 
-    aiRequestsTotal.inc({ type: 'roadtrip_advisor', status: 'success' });
     res.status(200).json(response);
 
   } catch (error) {
-    aiRequestsTotal.inc({ type: 'roadtrip_advisor', status: 'failed' });
     logger.error("💥 Erreur IA:", error);
     res.status(500).json({ error: "Erreur serveur IA." });
   }
 };
 
-// 🔧 NOUVELLE FONCTION : Formater la réponse roadtrip
 const formatRoadtripResponse = (result) => {
   if (result.type === 'error') {
     return result.message;
   }
   
-  // Formatage selon votre style existant
   let formatted = `\n✨ **ROADTRIP : ${result.destination?.toUpperCase()}**\n`;
   formatted += `🗓️ Durée recommandée : **${result.duree_recommandee}**\n`;
   formatted += `📅 Saison idéale : **${result.saison_ideale}**\n`;

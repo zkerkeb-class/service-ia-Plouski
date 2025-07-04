@@ -1,7 +1,4 @@
 const logger = require('../utils/logger');
-const { 
-  aiRequestsTotal, 
-} = require("../services/metricsService");
 
 const errorHandler = (err, req, res, next) => {
   logger.error('💥 Middleware Error Handler:', {
@@ -11,11 +8,6 @@ const errorHandler = (err, req, res, next) => {
     method: req.method,
     ip: req.ip
   });
-
-  // Incrémenter métrique d'erreur IA
-  if (req.path.includes('/ai/')) {
-    aiRequestsTotal.inc({ type: 'unknown', status: 'failed' });
-  }
 
   // Erreurs spécifiques IA
   if (err.message && err.message.includes('OpenAI')) {

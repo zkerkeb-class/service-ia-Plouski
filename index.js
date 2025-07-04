@@ -2,251 +2,211 @@ require("dotenv").config();
 const express = require("express");
 const cors = require("cors");
 const aiRoutes = require("./routes/aiRoutes");
-const metricsRoutes = require("./routes/metricsRoutes");
 const logger = require("./utils/logger");
 const {
+  register,
+  httpRequestDuration,
   httpRequestsTotal,
-  httpDurationHistogram,
-  serviceHealthStatus,
-  cacheHitRate,
-} = require('./services/metricsService');
+  updateServiceHealth,
+  updateActiveConnections,
+  updateExternalServiceHealth
+} = require("./metrics");
 
 const app = express();
 const PORT = process.env.PORT || 5003;
+const METRICS_PORT = process.env.METRICS_PORT || 9003;
+const SERVICE_NAME = "ai-service";
 
-console.log("🔥Lancement du AI Service...");
+console.log(`🔥 Lancement du ${SERVICE_NAME}...`);
 
-// Vérifications essentielles
+// CONFIGURATION DE BASE
+
+// Vérifications
 if (!process.env.OPENAI_API_KEY) {
   console.error("❌ OPENAI_API_KEY manquante!");
+  updateServiceHealth(SERVICE_NAME, false);
   process.exit(1);
 }
 
-// Middlewares essentiels
+// CORS
 app.use(cors({
-  origin: [
-    "http://localhost:3000",
-    "http://127.0.0.1:3000",
-    process.env.FRONTEND_URL || "http://localhost:3000"
-  ],
-  credentials: true
+  origin: process.env.FRONTEND_URL || "http://localhost:3000",
+  credentials: true,
 }));
 
 app.use(express.json({ limit: "2mb" }));
 
-// Middleware de métriques Prometheus 
+// MIDDLEWARE DE MÉTRIQUES
+
+let currentConnections = 0;
+
 app.use((req, res, next) => {
-  const start = process.hrtime();
+  const start = Date.now();
+  currentConnections++;
+  updateActiveConnections(currentConnections);
 
   res.on("finish", () => {
-    const duration = process.hrtime(start);
-    const seconds = duration[0] + duration[1] / 1e9;
+    const duration = (Date.now() - start) / 1000;
+    currentConnections--;
+    updateActiveConnections(currentConnections);
 
-    httpDurationHistogram.observe(
+    httpRequestDuration.observe(
       {
         method: req.method,
-        route: req.route ? req.route.path : req.path,
+        route: req.route?.path || req.path,
         status_code: res.statusCode,
       },
-      seconds
+      duration
     );
 
     httpRequestsTotal.inc({
       method: req.method,
-      route: req.route ? req.route.path : req.path,
+      route: req.route?.path || req.path,
       status_code: res.statusCode,
     });
+
+    logger.info(`${req.method} ${req.path} - ${res.statusCode} - ${Math.round(duration * 1000)}ms`);
   });
 
   next();
 });
 
-// Logging avec métriques 
-app.use((req, res, next) => {
-  const start = Date.now();
-  res.on("finish", () => {
-    const duration = Date.now() - start;
-    logger.info(`${req.method} ${req.path} - ${res.statusCode} - ${duration}ms`);
-  });
-  next();
+// ROUTES STANDARD
+
+// Métriques Prometheus
+app.get("/metrics", async (req, res) => {
+  res.set("Content-Type", register.contentType);
+  res.end(await register.metrics());
 });
 
-// Routes 
-app.use("/api/ai", aiRoutes);
-app.use("/metrics", metricsRoutes);
-
-// Health check avec métriques 
+// Health check
 app.get("/health", (req, res) => {
   const health = {
     status: "healthy",
     timestamp: new Date().toISOString(),
     uptime: process.uptime(),
-    service: "ai-service",
-    version: "1.0.0",
-    services: {
-      openai: process.env.OPENAI_API_KEY ? "configured" : "missing",
-      weather: process.env.WEATHER_API_KEY ? "configured" : "not-configured"
-    }
+    service: SERVICE_NAME,
+    version: "1.0.0"
   };
 
-  if (!process.env.OPENAI_API_KEY || !process.env.OPENAI_API_KEY.startsWith("sk-")) {
-    health.status = "degraded";
-    health.services.openai = "misconfigured";
+  if (!process.env.OPENAI_API_KEY) {
+    health.status = "unhealthy";
   }
 
-  const isHealthy = health.status === "healthy" ? 1 : 0;
-  serviceHealthStatus.set({ service_name: "ai-service" }, isHealthy);
+  const isHealthy = health.status === "healthy";
+  updateServiceHealth(SERVICE_NAME, isHealthy);
 
-  const statusCode = health.status === "healthy" ? 200 : 503;
+  const statusCode = isHealthy ? 200 : 503;
   res.status(statusCode).json(health);
 });
 
-app.get("/ping", (req, res) => {
-  res.json({
-    status: "pong ✅",
-    timestamp: new Date().toISOString(),
-    service: "ai-service",
-    uptime: process.uptime(),
-    memory: process.memoryUsage(),
-    pid: process.pid
-  });
-});
-
-// Endpoint de métriques custom 
+// Vitals
 app.get("/vitals", (req, res) => {
   const vitals = {
-    service: "ai-service",
+    service: SERVICE_NAME,
     timestamp: new Date().toISOString(),
     uptime: process.uptime(),
     memory: process.memoryUsage(),
     cpu: process.cpuUsage(),
-    pid: process.pid,
-    node_version: process.version,
-    environment: process.env.NODE_ENV || "development",
-    
-    features: {
-      roadtrip_validation: true,
-      duration_limit: 14,
-      topic_filtering: true,
-      weather_integration: !!process.env.WEATHER_API_KEY,
-      cache_enabled: true
-    },
-    
-    cache: getCacheStats(),
-    
-    limits: {
-      max_duration_days: 14,
-      cache_ttl_seconds: 3600,
-      request_timeout_ms: 30000
-    }
+    status: "running",
+    active_connections: currentConnections
   };
 
   res.json(vitals);
 });
 
-// Gestion d'erreurs avec métriques 
-app.use((req, res) => {
-  httpRequestsTotal.inc({
-    method: req.method,
-    route: "404",
-    status_code: 404,
+// Ping
+app.get("/ping", (req, res) => {
+  res.json({
+    status: "pong ✅",
+    service: SERVICE_NAME,
+    timestamp: new Date().toISOString(),
+    uptime: process.uptime()
   });
+});
 
+// ROUTES SPÉCIFIQUES AU SERVICE
+
+app.use("/api/ai", aiRoutes);
+
+// GESTION D'ERREURS
+
+app.use((req, res) => {
   res.status(404).json({
     error: "Route non trouvée",
-    message: `${req.method} ${req.path} n'existe pas`,
+    service: SERVICE_NAME,
     availableRoutes: [
-      "GET /health",
-      "GET /ping",
-      "GET /vitals",
-      "GET /metrics", 
+      "GET /health", "GET /vitals", "GET /metrics", "GET /ping",
       "POST /api/ai/ask"
-    ]
+    ],
   });
 });
 
 app.use((err, req, res, next) => {
-  logger.error("💥 Erreur:", err.message);
+  logger.error(`💥 Erreur ${SERVICE_NAME}:`, err.message);
   
-  httpRequestsTotal.inc({
-    method: req.method,
-    route: req.route ? req.route.path : req.path,
-    status_code: 500,
-  });
-
-  if (err.message.includes("OpenAI")) {
-    return res.status(503).json({
-      error: "Service IA indisponible",
-      message: "L'assistant IA est temporairement indisponible"
-    });
-  }
-
-  if (err.message.includes("CORS")) {
-    return res.status(403).json({
-      error: "Accès non autorisé",
-      message: "Origin non autorisée"
-    });
-  }
-
   res.status(500).json({
     error: "Erreur serveur",
-    message: err.message || "Une erreur est survenue"
+    service: SERVICE_NAME,
+    message: err.message
   });
 });
 
-// Fonction utilitaire pour les stats de cache 
-function getCacheStats() {
-  try {
-    const NodeCache = require("node-cache");
-    const testCache = new NodeCache();
-    const stats = testCache.getStats();
-    
-    const hitRate = stats.hits > 0 
-      ? stats.hits / (stats.hits + stats.misses) 
-      : 0;
-    
-    cacheHitRate.set(hitRate);
-    
-    return {
-      keys: stats.keys,
-      hits: stats.hits,
-      misses: stats.misses,
-      hit_rate: hitRate,
-      status: "healthy"
-    };
-  } catch (error) {
-    return {
-      status: "error",
-      message: error.message
-    };
-  }
+// DÉMARRAGE
+
+// Serveur principal
+app.listen(PORT, () => {
+  console.log(`🤖 ${SERVICE_NAME} démarré sur le port ${PORT}`);
+  console.log(`📊 Métriques: http://localhost:${PORT}/metrics`);
+  console.log(`❤️ Health: http://localhost:${PORT}/health`);
+  console.log(`📈 Vitals: http://localhost:${PORT}/vitals`);
+  
+  updateServiceHealth(SERVICE_NAME, true);
+  updateExternalServiceHealth("openai", true);
+  
+  logger.info(`✅ ${SERVICE_NAME} démarré avec métriques`);
+});
+
+// Serveur métriques séparé (pour Prometheus)
+const metricsApp = express();
+metricsApp.get('/metrics', async (req, res) => {
+  res.set('Content-Type', register.contentType);
+  res.end(await register.metrics());
+});
+
+metricsApp.get('/health', (req, res) => {
+  res.json({ status: 'healthy', service: `${SERVICE_NAME}-metrics` });
+});
+
+metricsApp.listen(METRICS_PORT, () => {
+  console.log(`📊 Metrics server running on port ${METRICS_PORT}`);
+});
+
+// GRACEFUL SHUTDOWN
+
+function gracefulShutdown(signal) {
+  console.log(`🔄 Arrêt ${SERVICE_NAME} (${signal})...`);
+  updateServiceHealth(SERVICE_NAME, false);
+  updateActiveConnections(0);
+  
+  setTimeout(() => {
+    process.exit(0);
+  }, 1000);
 }
 
-// Démarrage 
-app.listen(PORT, () => {
-  console.log(`🤖 AI service démarré sur http://localhost:${PORT}`);
-  console.log(`🔐 Environnement: ${process.env.NODE_ENV || "development"}`);
-  console.log(`❤️ Health check: http://localhost:${PORT}/health`);
-  console.log(`📊 Métriques: http://localhost:${PORT}/metrics`);
-  console.log(`📈 Vitals: http://localhost:${PORT}/vitals`);
-  console.log(`🧠 API IA: http://localhost:${PORT}/api/ai`);
-  
-  serviceHealthStatus.set({ service_name: "ai-service" }, 1);
-  
-  logger.info("✅ AI Service démarré avec succès");
+process.on("SIGTERM", gracefulShutdown);
+process.on("SIGINT", gracefulShutdown);
+
+// Gestion des erreurs non capturées
+process.on('unhandledRejection', (reason, promise) => {
+  logger.error('Unhandled Rejection:', reason);
+  updateServiceHealth(SERVICE_NAME, false);
 });
 
-// Gestion graceful shutdown 
-process.on('SIGTERM', () => {
-  console.log('🔄 Arrêt gracieux du service...');
-  serviceHealthStatus.set({ service_name: "ai-service" }, 0);
-  process.exit(0);
-});
-
-process.on('SIGINT', () => {
-  console.log('🔄 Arrêt gracieux du service...');
-  serviceHealthStatus.set({ service_name: "ai-service" }, 0);
-  process.exit(0);
+process.on('uncaughtException', (error) => {
+  logger.error('Uncaught Exception:', error);
+  updateServiceHealth(SERVICE_NAME, false);
+  process.exit(1);
 });
 
 module.exports = app;
